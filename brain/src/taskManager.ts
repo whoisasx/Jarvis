@@ -1,0 +1,335 @@
+import {AndroidAgent, type HistoryStep} from './agent.js';
+import type {CapabilityManager} from './capabilityManager.js';
+import type {ContextBuilder, PlannerContext} from './contextBuilder.js';
+import type {EventBus, JarvisEventPriority, JarvisEventType} from './eventBus.js';
+import type {EventHistory} from './eventHistory.js';
+import {logEvent} from './logger.js';
+import type {AgentAction, BrainMessage, ScreenState} from './protocol.js';
+import type {PhoneTransport} from './phoneTransport.js';
+import type {WorkingMemory} from './workingMemory.js';
+import type {WorldStateManager} from './worldState.js';
+
+export type TaskState = 'queued' | 'running' | 'waiting' | 'paused' | 'blocked' | 'completed' | 'failed' | 'cancelled';
+
+interface ActiveTask {
+  id: string;
+  instruction: string;
+  history: HistoryStep[];
+  processing: boolean;
+  startedAt: string;
+  actionCount: number;
+  state: TaskState;
+  waitingFor?: string;
+  pendingSince: number;
+}
+
+export class TaskManager {
+  private phone: PhoneTransport | null = null;
+  private task: ActiveTask | null = null;
+  private recentPhoneEvents: Record<string, unknown>[] = [];
+  private lastPlannerContext: PlannerContext | null = null;
+
+  constructor(
+    private readonly agent: AndroidAgent,
+    private readonly options: {
+      eventBus?: EventBus;
+      capabilityManager?: CapabilityManager;
+      contextBuilder?: ContextBuilder;
+      worldState?: WorldStateManager;
+      workingMemory?: WorkingMemory;
+      eventHistory?: EventHistory;
+    } = {},
+  ) {}
+
+  attachPhone(phone: PhoneTransport): void {
+    if (this.phone && this.phone !== phone) {
+      this.phone.close?.(4001, 'Replaced by a new phone connection');
+    }
+    this.phone = phone;
+    phone.onClose(() => {
+      if (this.phone === phone) this.phone = null;
+    });
+  }
+
+  hasPhone(): boolean {
+    return this.phone !== null && this.phone.isConnected();
+  }
+
+  getTask(): Readonly<ActiveTask> | null {
+    return this.task;
+  }
+
+  getLastPlannerContext(): PlannerContext | null {
+    return this.lastPlannerContext ? JSON.parse(JSON.stringify(this.lastPlannerContext)) as PlannerContext : null;
+  }
+
+  async startTask(instruction: string): Promise<string> {
+    if (!this.hasPhone()) throw new Error('Phone is not connected');
+    if (this.task) throw new Error('A task is already active');
+
+    const id = createTaskId();
+    this.task = {
+      id,
+      instruction,
+      history: [],
+      processing: false,
+      startedAt: new Date().toISOString(),
+      actionCount: 0,
+      state: 'queued',
+      pendingSince: 0,
+    };
+    await logEvent({kind: 'task_started', taskId: id, instruction});
+    this.publish('task.started', 'brain.task_manager', {taskId: id, instruction, state: 'queued'}, 'high', id);
+    this.send({type: 'task_status', status: 'started', detail: instruction});
+    this.setTaskState('waiting', 'screen_state');
+    this.send({type: 'request_screen_state'});
+    return id;
+  }
+
+  async onScreenState(screen: ScreenState): Promise<void> {
+    const task = this.task;
+    if (!task || task.processing) return;
+
+    const awaitingResult = task.history.at(-1)?.result === null;
+    if (awaitingResult && !screen.lastActionResult) {
+      // No mutex needed here: this branch never reaches nextAction() and
+      // must stay lock-free so a coincident null-result accessibility echo
+      // can never block the real result-bearing screen_state below.
+      await this.tryRecoverStalledTask(task);
+      return;
+    }
+
+    // Raised immediately, before the history mutation's `await logEvent`
+    // below, so a second screen_state racing this one can never slip past
+    // the guard above and invoke nextAction() concurrently with this call.
+    task.processing = true;
+    try {
+      this.setTaskState('running');
+
+      // === OPEN_APP TRACING BEGIN ===
+      const isOpenApp = task.history.length >= 2 &&
+        task.history[task.history.length - 2]?.action?.action === 'open_app';
+      const openAppResult = screen.lastActionResult;
+      const openAppAwaiting = awaitingResult;
+      // === OPEN_APP TRACING END ===
+
+      if (task.history.length > 0 && screen.lastActionResult) {
+        task.history[task.history.length - 1]!.result = screen.lastActionResult;
+        const isOpenAppResult = task.history.length >= 2 &&
+          task.history[task.history.length - 2]?.action?.action === 'open_app';
+        await logEvent({kind: 'action_result', taskId: task.id, result: screen.lastActionResult, isOpenAppResult, packageName: screen.packageName});
+        this.publish('executor.action_result', 'brain.executor', {
+          taskId: task.id,
+          result: screen.lastActionResult,
+          packageName: screen.packageName,
+        }, 'normal', task.id);
+      }
+
+      this.publish('planner.requested', 'brain.task_manager', {
+        taskId: task.id,
+        instruction: task.instruction,
+        packageName: screen.packageName,
+        historyLength: task.history.length,
+      }, 'normal', task.id);
+      const plannerContext = this.buildPlannerContext(task.instruction);
+      this.lastPlannerContext = plannerContext;
+      const action = await this.agent.nextAction(
+        task.instruction,
+        screen,
+        task.history,
+        this.recentPhoneEvents.slice(-30),
+        plannerContext,
+      );
+      const actionJson = JSON.stringify(action);
+      const repeatedThreeTimes =
+        action.action !== 'task_complete' &&
+        action.action !== 'task_failed' &&
+        task.history.slice(-2).length === 2 &&
+        task.history.slice(-2).every(step => JSON.stringify(step.action) === actionJson);
+
+      if (repeatedThreeTimes) {
+        await this.dispatchAction(task.id, {
+          action: 'task_failed',
+          reason: `Stopped after the same action repeated three times: ${action.action}`,
+        });
+        return;
+      }
+
+      if (task.actionCount >= 20) {
+        await this.dispatchAction(task.id, {
+          action: 'task_failed',
+          reason: 'Stopped after reaching the 20-action safety limit',
+        });
+        return;
+      }
+
+      task.actionCount += 1;
+      await this.dispatchAction(task.id, action);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await logEvent({kind: 'agent_error', taskId: task.id, reason});
+      await this.dispatchAction(task.id, {action: 'task_failed', reason: `Agent error: ${reason}`});
+    } finally {
+      if (this.task === task) task.processing = false;
+    }
+  }
+
+  async logPassiveEvent(event: Record<string, unknown>): Promise<void> {
+    this.recentPhoneEvents.push(event);
+    if (this.recentPhoneEvents.length > 100) this.recentPhoneEvents.shift();
+    await logEvent({kind: 'phone_event', ...event});
+  }
+
+  private async tryRecoverStalledTask(task: ActiveTask): Promise<void> {
+    const pending = task.history.at(-1)?.action;
+    if (!pending || task.pendingSince === 0) return;
+    const deadline = task.pendingSince + resultDeadlineMs(pending);
+    if (Date.now() < deadline) return;
+
+    const waitingMs = Date.now() - task.pendingSince;
+    await logEvent({kind: 'action_result_timeout', taskId: task.id, action: pending, waitingMs});
+    this.publish('executor.action_result_timeout', 'brain.executor', {
+      taskId: task.id,
+      action: pending,
+      waitingMs,
+    }, 'high', task.id);
+    // Re-dispatch a harmless wait so the phone emits a fresh result-bearing
+    // screen snapshot and the loop can advance instead of waiting forever.
+    await this.dispatchAction(task.id, {
+      action: 'wait',
+      ms: 750,
+      status: 'Recovering from a delayed action result',
+      progress: Math.min(95, 20 + task.history.length * 10),
+    });
+  }
+
+  private async dispatchAction(taskId: string, action: AgentAction): Promise<void> {
+    const capability = this.options.capabilityManager?.checkAction(action);
+    this.publish('planner.action_selected', 'brain.planner', {taskId, action}, 'normal', taskId);
+    if (capability) {
+      this.publish('capability.check', 'brain.capability_manager', {
+        taskId,
+        action: action.action,
+        available: capability.available,
+        required: capability.required,
+        reason: capability.reason,
+      }, capability.available ? 'low' : 'high', taskId);
+    }
+    if (capability && !capability.available) {
+      const reason = capability.reason ?? 'Missing required capability';
+      this.setTaskState('blocked', reason);
+      await logEvent({kind: 'capability_blocked', taskId, action, reason, required: capability.required});
+      this.publish('capability.unavailable', 'brain.capability_manager', {
+        taskId,
+        action: action.action,
+        reason,
+        required: capability.required,
+      }, 'high', taskId);
+      this.send({type: 'task_status', status: 'blocked', detail: reason});
+      return;
+    }
+
+    await logEvent({kind: 'action', taskId, action});
+    this.publish('executor.action_started', 'brain.executor', {taskId, action}, 'normal', taskId);
+    this.send({type: 'action', ...action});
+
+    if (action.action === 'task_complete' || action.action === 'task_failed') {
+      await logEvent({kind: 'task_finished', taskId, outcome: action});
+      const state = action.action === 'task_complete' ? 'completed' : 'failed';
+      this.publish(state === 'completed' ? 'task.completed' : 'task.failed', 'brain.task_manager', {
+        taskId,
+        outcome: action,
+        state,
+      }, 'high', taskId);
+      this.task = null;
+      return;
+    }
+
+this.task?.history.push({action, result: null});
+    if (this.task) {
+      if (this.task.history.length > 10) this.task.history.shift();
+      this.task.pendingSince = Date.now();
+    }
+    this.setTaskState('waiting', 'action_result');
+  }
+
+  private setTaskState(state: TaskState, waitingFor?: string): void {
+    if (!this.task) return;
+    this.task.state = state;
+    this.task.waitingFor = waitingFor;
+    this.publish('task.status', 'brain.task_manager', {
+      taskId: this.task.id,
+      state,
+      waitingFor: waitingFor ?? null,
+    }, state === 'blocked' ? 'high' : 'low', this.task.id);
+  }
+
+  private publish(
+    type: JarvisEventType,
+    source: string,
+    payload: Record<string, unknown>,
+    priority: JarvisEventPriority = 'normal',
+    correlationId?: string,
+  ): void {
+    this.options.eventBus?.publish({type, source, payload, priority, correlationId});
+  }
+
+  private buildPlannerContext(instruction: string): PlannerContext | null {
+    if (!this.options.contextBuilder || !this.options.worldState || !this.options.workingMemory || !this.options.eventHistory) {
+      return null;
+    }
+    return this.options.contextBuilder.build({
+      task: instruction,
+      worldState: this.options.worldState.snapshot(),
+      workingMemory: this.options.workingMemory.snapshot(),
+      recentEvents: this.options.eventHistory.recent(80),
+    });
+  }
+
+  private send(message: BrainMessage): void {
+    if (!this.phone || !this.phone.isConnected()) {
+      throw new Error('Phone disconnected');
+    }
+    this.phone.send(message);
+  }
+}
+
+let taskIdCounter = 0;
+
+function resultDeadlineMs(action: AgentAction): number {
+  // Log the deadline calculation for debugging
+  // await logEvent({kind: 'deadline_calc', action: action.action, ms: action.ms});
+  if (action.action === 'wait') return action.ms + 3_000;
+  switch (action.action) {
+    case 'open_app':
+      return 12_000;
+    case 'call':
+      return 10_000;
+    default:
+      return 8_000;
+  }
+}
+
+function createTaskId(): string {
+  const runtimeCrypto = (globalThis as {
+    crypto?: {
+      randomUUID?: () => string;
+      getRandomValues?: (array: Uint8Array) => Uint8Array;
+    };
+  }).crypto;
+
+  if (runtimeCrypto?.randomUUID) {
+    return runtimeCrypto.randomUUID();
+  }
+
+  if (runtimeCrypto?.getRandomValues) {
+    const bytes = runtimeCrypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0'));
+    return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
+  }
+
+  taskIdCounter = (taskIdCounter + 1) % Number.MAX_SAFE_INTEGER;
+  return `task-${Date.now().toString(36)}-${taskIdCounter.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
